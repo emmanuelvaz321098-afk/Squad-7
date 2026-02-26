@@ -1,94 +1,346 @@
+ """
+ACOUSTIC SENTINEL v3.0 - Full Stack Deploy
+New: Map view, multiple gunshot tracking, sound alarm
 """
-ACOUSTIC SENTINEL - Full Stack Deploy
-"""
-import asyncio, json, math, time
+import json, math, time
 import numpy as np
 from fastapi import FastAPI, WebSocket, WebSocketDisconnect
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import HTMLResponse
 
-SPEED_OF_SOUND=343.0; SAMPLE_RATE=44100; GUNSHOT_RMS_THRESHOLD=0.12; COOLDOWN_FRAMES=30
-app=FastAPI(title="Acoustic Sentinel")
-app.add_middleware(CORSMiddleware,allow_origins=["*"],allow_methods=["*"],allow_headers=["*"])
-events=[]
+SPEED_OF_SOUND = 343.0
+SAMPLE_RATE    = 44100
+GUNSHOT_RMS_THRESHOLD = 0.12
+COOLDOWN_FRAMES = 30
+MAX_EVENTS = 200
+
+app = FastAPI(title="Acoustic Sentinel v3")
+app.add_middleware(CORSMiddleware, allow_origins=["*"], allow_methods=["*"], allow_headers=["*"])
+
+events: list[dict] = []
 
 def rms(s): return float(np.sqrt(np.mean(s**2)))
-def db(s): return 20*math.log10(max(rms(s),1e-10))
-def gcc_phat(x,y,max_lag=None):
-    n=len(x)+len(y)-1; n_fft=1<<(n-1).bit_length()
-    X,Y=np.fft.rfft(x,n=n_fft),np.fft.rfft(y,n=n_fft)
-    G=X*np.conj(Y); denom=np.abs(G); denom[denom<1e-10]=1e-10; G/=denom
-    cc=np.fft.irfft(G,n=n_fft)
-    if max_lag is None: max_lag=len(x)//2
-    cc=np.concatenate([cc[-max_lag:],cc[:max_lag+1]]); lag=int(np.argmax(cc))-max_lag
-    return lag,float(np.max(cc))
-def tdoa_to_doa(lag,spacing):
-    tau=lag/SAMPLE_RATE; c=max(-1.0,min(1.0,(SPEED_OF_SOUND*tau)/spacing))
+def db(s):  return 20 * math.log10(max(rms(s), 1e-10))
+
+def gcc_phat(x, y, max_lag=None):
+    n = len(x) + len(y) - 1
+    n_fft = 1 << (n - 1).bit_length()
+    X, Y = np.fft.rfft(x, n=n_fft), np.fft.rfft(y, n=n_fft)
+    G = X * np.conj(Y)
+    denom = np.abs(G); denom[denom < 1e-10] = 1e-10
+    G /= denom
+    cc = np.fft.irfft(G, n=n_fft)
+    if max_lag is None: max_lag = len(x) // 2
+    cc = np.concatenate([cc[-max_lag:], cc[:max_lag+1]])
+    lag = int(np.argmax(cc)) - max_lag
+    return lag, float(np.max(cc))
+
+def tdoa_to_doa(lag, spacing):
+    tau = lag / SAMPLE_RATE
+    c = max(-1.0, min(1.0, (SPEED_OF_SOUND * tau) / spacing))
     return math.degrees(math.acos(c))
-def classify(sig_a,sig_b,threshold):
-    r=rms(sig_a)
-    if r<threshold: return False,0.0
-    spec=np.abs(np.fft.rfft(sig_a)); geo=np.exp(np.mean(np.log(spec+1e-10))); arith=np.mean(spec)
-    conf=0.6*min(r/(threshold*3),1.0)+0.4*min((geo/(arith+1e-10))/0.3,1.0)
-    return True,float(conf)
 
-HTML=open(__file__).read().split('HTML_CONTENT_START')[1].split('HTML_CONTENT_END')[0] if False else """<!DOCTYPE html><html lang="en"><head><meta charset="UTF-8"><meta name="viewport" content="width=device-width,initial-scale=1.0,maximum-scale=1.0"><title>ACOUSTIC SENTINEL</title><link href="https://fonts.googleapis.com/css2?family=Share+Tech+Mono&family=Orbitron:wght@400;700;900&display=swap" rel="stylesheet"><style>:root{--bg:#080b0f;--panel:#0d1117;--border:#1a2535;--accent:#00ff88;--accent2:#ff3c3c;--accent3:#ffb800;--dim:#1e2d3d;--text:#c8d8e8;--text-dim:#4a6070}*{margin:0;padding:0;box-sizing:border-box}body{background:var(--bg);color:var(--text);font-family:'Share Tech Mono',monospace;min-height:100vh}header{display:flex;align-items:center;justify-content:space-between;padding:12px 16px;border-bottom:1px solid var(--border);background:rgba(13,17,23,.97);position:sticky;top:0;z-index:100;flex-wrap:wrap;gap:8px}.logo{display:flex;align-items:center;gap:12px}.logo-icon{width:32px;height:32px;border:2px solid var(--accent);border-radius:50%;display:flex;align-items:center;justify-content:center;position:relative;box-shadow:0 0 20px rgba(0,255,136,.3);flex-shrink:0}.logo-icon::before{content:'';width:7px;height:7px;background:var(--accent);border-radius:50%;animation:pulse 2s infinite}.logo-icon::after{content:'';position:absolute;width:44px;height:44px;border:1px solid rgba(0,255,136,.2);border-radius:50%;animation:radar-ring 2s infinite}@keyframes radar-ring{0%{transform:scale(.7);opacity:.8}100%{transform:scale(1.4);opacity:0}}@keyframes pulse{0%,100%{opacity:1}50%{opacity:.3}}@keyframes flash{from{opacity:1}to{opacity:.4}}.logo-text{font-family:'Orbitron',monospace;font-weight:900;font-size:15px;letter-spacing:3px;color:var(--accent)}.logo-sub{font-size:9px;color:var(--text-dim);letter-spacing:2px}.hdr-right{display:flex;gap:16px;align-items:center}.status-item{text-align:center;font-size:9px;color:var(--text-dim)}.status-val{display:block;font-family:'Orbitron',monospace;font-size:12px;color:var(--accent)}#system-status{display:flex;align-items:center;gap:6px;font-size:10px;letter-spacing:2px}.dot{width:7px;height:7px;border-radius:50%;background:var(--text-dim);transition:all .3s;flex-shrink:0}.dot.active{background:var(--accent);box-shadow:0 0 20px rgba(0,255,136,.3);animation:pulse 1.5s infinite}.dot.alert{background:var(--accent2);box-shadow:0 0 20px rgba(255,60,60,.5);animation:pulse .5s infinite}.dot.warn{background:var(--accent3);animation:pulse 1s infinite}.app{display:flex;flex-direction:column;min-height:calc(100vh - 65px)}.panel{border:1px solid var(--border);background:var(--panel);position:relative;overflow:hidden}.panel::before{content:'';position:absolute;top:0;left:0;right:0;height:1px;background:linear-gradient(90deg,transparent,var(--accent),transparent);opacity:.4}.panel-label{position:absolute;top:10px;left:14px;font-size:9px;letter-spacing:3px;color:var(--text-dim);z-index:2}.panel-label span{color:var(--accent)}.doa-panel{display:flex;flex-direction:column;align-items:center;padding:40px 16px 20px;gap:16px}.polar-wrap{position:relative;width:min(340px,90vw);height:min(340px,90vw)}#polar{width:100%;height:100%}.doa-readout{text-align:center;width:100%}.doa-angle{font-family:'Orbitron',monospace;font-size:48px;font-weight:900;color:var(--accent);line-height:1}.doa-label{font-size:9px;color:var(--text-dim);letter-spacing:3px;margin-top:4px}.tdoa-display{display:flex;gap:24px;margin-top:10px;justify-content:center}.tdoa-item{text-align:center}.tdoa-val{font-family:'Orbitron',monospace;font-size:14px;color:var(--accent3)}.tdoa-lbl{font-size:9px;color:var(--text-dim)}.detect-panel{padding:40px 16px 16px}.detect-status{display:flex;align-items:center;justify-content:space-between;margin-bottom:12px}.detect-badge{font-family:'Orbitron',monospace;font-size:10px;letter-spacing:2px;padding:5px 12px;border:1px solid var(--text-dim);color:var(--text-dim);transition:all .3s}.detect-badge.gunshot{border-color:var(--accent2);color:var(--accent2);box-shadow:0 0 20px rgba(255,60,60,.5);animation:flash .3s ease infinite alternate}.detect-badge.clear{border-color:var(--accent);color:var(--accent)}.confidence-bar{height:4px;background:var(--dim);border-radius:2px;overflow:hidden;margin-bottom:10px}.confidence-fill{height:100%;background:linear-gradient(90deg,var(--accent),var(--accent3));width:0%;transition:width .4s ease;border-radius:2px}.conf-label{font-size:9px;color:var(--text-dim);letter-spacing:2px}.conf-val{float:right;color:var(--accent3)}#waveform{width:100%;height:70px;display:block;border:1px solid var(--dim);border-radius:2px;margin-top:10px}.mic-panel{padding:40px 16px 16px}.mic-array{display:flex;gap:10px;align-items:center;margin-bottom:14px}.mic-unit{flex:1;border:1px solid var(--dim);padding:10px;text-align:center;transition:all .3s}.mic-unit.active{border-color:var(--accent);box-shadow:0 0 20px rgba(0,255,136,.3)}.mic-name{font-size:9px;color:var(--text-dim);letter-spacing:2px}.mic-level{font-family:'Orbitron',monospace;font-size:16px;color:var(--accent);margin:4px 0}.mic-bar{height:3px;background:var(--dim);border-radius:2px;overflow:hidden}.mic-bar-fill{height:100%;background:var(--accent);width:0%;transition:width .1s;border-radius:2px}.mic-arrow{font-size:18px;color:var(--text-dim);flex-shrink:0}.spacing-control{display:flex;align-items:center;gap:10px;font-size:10px;color:var(--text-dim);margin-bottom:12px}.spacing-control input[type=range]{flex:1;-webkit-appearance:none;height:2px;background:var(--dim);outline:none;border-radius:2px}.spacing-control input[type=range]::-webkit-slider-thumb{-webkit-appearance:none;width:14px;height:14px;background:var(--accent);border-radius:50%;cursor:pointer}.spacing-val{color:var(--accent);min-width:50px}.btn{width:100%;padding:12px;font-family:'Orbitron',monospace;font-size:11px;letter-spacing:3px;border:1px solid var(--accent);background:transparent;color:var(--accent);cursor:pointer;transition:all .2s;touch-action:manipulation}.btn.active{background:rgba(0,255,136,.1)}.btn.danger{border-color:var(--accent2);color:var(--accent2)}.sim-row{display:flex;gap:8px;margin-top:8px}.btn-sm{padding:12px 4px;font-size:9px;flex:1}.log-panel{padding:40px 0 0;flex:1}.log-header{padding:0 16px 12px;display:flex;justify-content:space-between;align-items:center;border-bottom:1px solid var(--dim)}.log-count{font-family:'Orbitron',monospace;font-size:20px;color:var(--accent2)}.log-count-lbl{font-size:9px;color:var(--text-dim);letter-spacing:2px;display:block}.log-list{max-height:280px;overflow-y:auto}.log-entry{padding:12px 16px;border-bottom:1px solid rgba(26,37,53,.5);display:grid;grid-template-columns:1fr auto;gap:4px;animation:slideIn .3s ease}@keyframes slideIn{from{opacity:0;transform:translateX(8px)}to{opacity:1;transform:translateX(0)}}.log-entry.gunshot{border-left:3px solid var(--accent2)}.log-type{font-family:'Orbitron',monospace;font-size:10px;letter-spacing:2px}.log-entry.gunshot .log-type{color:var(--accent2)}.log-details{font-size:9px;color:var(--text-dim);margin-top:2px}.log-time{font-size:9px;color:var(--text-dim);text-align:right}.log-angle{font-family:'Orbitron',monospace;font-size:11px;color:var(--accent3)}.ws-bar{position:fixed;bottom:0;left:0;right:0;background:var(--panel);border-top:1px solid var(--border);padding:8px 16px;display:flex;align-items:center;gap:8px;font-size:9px;letter-spacing:2px;color:var(--text-dim);z-index:200}</style></head><body><header><div class="logo"><div class="logo-icon"></div><div><div class="logo-text">ACOUSTIC SENTINEL</div><div class="logo-sub">DOA GUNSHOT DETECTION v2.4</div></div></div><div class="hdr-right"><div class="status-item"><span class="status-val" id="hdr-time">--:--:--</span>UTC</div><div class="status-item"><span class="status-val" id="hdr-events">0</span>EVENTS</div><div id="system-status"><div class="dot" id="sys-dot"></div><span id="sys-label">STANDBY</span></div></div></header><div class="app"><div class="panel doa-panel"><div class="panel-label"><span>01</span> / DOA POLAR</div><div class="polar-wrap"><canvas id="polar" width="340" height="340"></canvas></div><div class="doa-readout"><div class="doa-angle" id="doa-angle">---°</div><div class="doa-label">DIRECTION OF ARRIVAL</div><div class="tdoa-display"><div class="tdoa-item"><div class="tdoa-val" id="tdoa-val">0.000</div><div class="tdoa-lbl">TDOA ms</div></div><div class="tdoa-item"><div class="tdoa-val" id="snr-val">--</div><div class="tdoa-lbl">SNR dB</div></div><div class="tdoa-item"><div class="tdoa-val" id="dist-val">0.50</div><div class="tdoa-lbl">MIC m</div></div></div></div></div><div class="panel detect-panel"><div class="panel-label"><span>02</span> / CLASSIFICATION</div><div class="detect-status"><div class="detect-badge" id="detect-badge">MONITORING</div><div style="text-align:right;font-size:9px;color:var(--text-dim)"><div>LAST: <span id="last-detect" style="color:var(--text)">--</span></div><div>PEAK: <span id="peak-db" style="color:var(--accent3)">-- dB</span></div></div></div><div class="conf-label">CONFIDENCE <span class="conf-val" id="conf-pct">0%</span></div><div class="confidence-bar"><div class="confidence-fill" id="conf-fill"></div></div><canvas id="waveform" width="340" height="70"></canvas></div><div class="panel mic-panel"><div class="panel-label"><span>03</span> / ARRAY</div><div class="mic-array"><div class="mic-unit" id="mic0"><div class="mic-name">MIC A</div><div class="mic-level" id="mic0-lvl">-∞</div><div class="mic-bar"><div class="mic-bar-fill" id="mic0-bar"></div></div></div><div class="mic-arrow">⟷</div><div class="mic-unit" id="mic1"><div class="mic-name">MIC B</div><div class="mic-level" id="mic1-lvl">-∞</div><div class="mic-bar"><div class="mic-bar-fill" id="mic1-bar"></div></div></div></div><div class="spacing-control">SPACING <input type="range" id="spacing-slider" min="0.1" max="2.0" step="0.05" value="0.5"> <span class="spacing-val" id="spacing-val">0.50 m</span></div><button class="btn" id="start-btn" onclick="toggleListening()">▶ START LISTENING</button><div class="sim-row"><button class="btn btn-sm" onclick="simGunshot(45)">SIM 45°</button><button class="btn btn-sm" onclick="simGunshot(90)">SIM 90°</button><button class="btn btn-sm" onclick="simGunshot(135)">SIM 135°</button><button class="btn btn-sm danger" onclick="clearEvents()">CLR</button></div></div><div class="panel log-panel"><div class="panel-label"><span>04</span> / EVENT LOG</div><div class="log-header"><div><span class="log-count-lbl">DETECTIONS</span><span class="log-count" id="log-count">0</span></div><div style="font-size:9px;color:var(--text-dim);letter-spacing:2px;">LATEST ↓</div></div><div class="log-list" id="log-list"></div></div></div><div class="ws-bar"><div class="dot" id="ws-dot"></div><span id="ws-label">CONNECTING...</span></div><script>const SPEED=343,API=window.location.origin,WS_URL=(location.protocol==='https:'?'wss:':'ws:')+'//'+location.host+'/ws/audio';let ws,audioCtx,analyserA,analyserB,stream,isListening=false,animFrame,micSpacing=.5,doaAngle=null,tdoaMs=0,detecting=false,detectTimeout,eventCount=0,lastPing=Date.now();const doaHistory=[],HIST=8,particles=[];function connectWS(){ws=new WebSocket(WS_URL);ws.onopen=()=>{set('ws-dot','dot active');set('ws-label','WS: CONNECTED')};ws.onclose=()=>{set('ws-dot','dot');set('ws-label','WS: RECONNECTING...');setTimeout(connectWS,3000)};ws.onerror=()=>{set('ws-dot','dot warn');set('ws-label','WS: ERROR')};ws.onmessage=e=>{const d=JSON.parse(e.data);if(d.doa!=null){doaHistory.push(d.doa);if(doaHistory.length>HIST)doaHistory.shift();doaAngle=doaHistory.reduce((a,b)=>a+b,0)/doaHistory.length}if(d.tdoa_ms!=null)tdoaMs=d.tdoa_ms;if(d.snr!=null)document.getElementById('snr-val').textContent=d.snr.toFixed(1);if(d.db_a!=null){document.getElementById('peak-db').textContent=d.db_a.toFixed(1)+' dB';updateMicBar(0,d.db_a,d.rms_a);updateMicBar(1,d.db_b,d.rms_b)}updateConf(d.confidence||0);updateReadout();if(d.is_gunshot)triggerDetect(doaAngle,d.confidence)}}connectWS();function set(id,cls){const el=document.getElementById(id);if(el)el.className=cls}setInterval(()=>document.getElementById('hdr-time').textContent=new Date().toUTCString().split(' ')[4],1000);document.getElementById('spacing-slider').addEventListener('input',function(){micSpacing=parseFloat(this.value);document.getElementById('spacing-val').textContent=micSpacing.toFixed(2)+' m';document.getElementById('dist-val').textContent=micSpacing.toFixed(2)});async function toggleListening(){isListening?stopListening():await startListening()}async function startListening(){try{audioCtx=new(window.AudioContext||window.webkitAudioContext)({sampleRate:44100});stream=await navigator.mediaDevices.getUserMedia({audio:{echoCancellation:false,noiseSuppression:false,autoGainControl:false}});const src=audioCtx.createMediaStreamSource(stream);analyserA=audioCtx.createAnalyser();analyserA.fftSize=2048;analyserA.smoothingTimeConstant=.2;analyserB=audioCtx.createAnalyser();analyserB.fftSize=2048;analyserB.smoothingTimeConstant=.2;const delay=audioCtx.createDelay(.05);src.connect(analyserA);src.connect(delay);delay.connect(analyserB);isListening=true;document.getElementById('start-btn').textContent='■ STOP LISTENING';document.getElementById('start-btn').classList.add('active');set('sys-dot','dot active');document.getElementById('sys-label').textContent='MONITORING';document.getElementById('mic0').classList.add('active');document.getElementById('mic1').classList.add('active');audioLoop()}catch(e){alert('Mic access denied. Use SIM buttons.')}}function stopListening(){isListening=false;if(animFrame)cancelAnimationFrame(animFrame);stream?.getTracks().forEach(t=>t.stop());audioCtx?.close();document.getElementById('start-btn').textContent='▶ START LISTENING';document.getElementById('start-btn').classList.remove('active');set('sys-dot','dot');document.getElementById('sys-label').textContent='STANDBY';document.getElementById('mic0').classList.remove('active');document.getElementById('mic1').classList.remove('active')}function audioLoop(){if(!isListening)return;animFrame=requestAnimationFrame(audioLoop);const dA=new Float32Array(2048),dB=new Float32Array(2048);analyserA.getFloatTimeDomainData(dA);analyserB.getFloatTimeDomainData(dB);drawWaveform(dA);if(ws?.readyState===1){lastPing=Date.now();ws.send(JSON.stringify({mic_a:Array.from(dA),mic_b:Array.from(dB),mic_spacing:micSpacing,sample_rate:44100}))}}async function simGunshot(angle){try{const r=await fetch(`${API}/api/simulate?angle=${angle}&mic_spacing=${micSpacing}`,{method:'POST'});const d=await r.json();doaAngle=d.doa;tdoaMs=d.tdoa_ms;triggerDetect(d.doa,d.confidence);updateReadout();const sim=new Float32Array(2048);for(let i=0;i<2048;i++){sim[i]=(Math.random()-.5)*.04;if(i>400&&i<600)sim[i]=(Math.random()-.5)*.85*Math.exp(-(i-500)/80)}drawWaveform(sim);addLog(d)}catch(e){const cos=Math.cos(angle*Math.PI/180);doaAngle=angle;tdoaMs=micSpacing*cos/SPEED*1000;triggerDetect(angle,.88);updateReadout();addLog({doa:angle,tdoa_ms:tdoaMs,confidence:.88,db_a:-22,timestamp_iso:new Date().toUTCString().split(' ')[4],simulated:true})}}function triggerDetect(angle,conf){detecting=true;document.getElementById('detect-badge').className='detect-badge gunshot';document.getElementById('detect-badge').textContent='⚠ GUNSHOT';set('sys-dot','dot alert');document.getElementById('sys-label').textContent='ALERT';document.getElementById('last-detect').textContent=new Date().toUTCString().split(' ')[4];updateConf(conf);clearTimeout(detectTimeout);detectTimeout=setTimeout(()=>{detecting=false;document.getElementById('detect-badge').className=isListening?'detect-badge clear':'detect-badge';document.getElementById('detect-badge').textContent='MONITORING';set('sys-dot',isListening?'dot active':'dot');document.getElementById('sys-label').textContent=isListening?'MONITORING':'STANDBY';updateConf(0)},4000)}function updateConf(v){const p=Math.round(v*100);document.getElementById('conf-fill').style.width=p+'%';document.getElementById('conf-pct').textContent=p+'%'}function updateMicBar(i,db,r){document.getElementById(`mic${i}-lvl`).textContent=isFinite(db)?db.toFixed(1):'-∞';document.getElementById(`mic${i}-bar`).style.width=Math.max(0,Math.min(100,(db+60)*1.5))+'%'}function updateReadout(){document.getElementById('doa-angle').textContent=doaAngle!==null?Math.round(doaAngle)+'°':'---°';document.getElementById('tdoa-val').textContent=tdoaMs.toFixed(3)}function addLog(d){eventCount++;document.getElementById('log-count').textContent=eventCount;document.getElementById('hdr-events').textContent=eventCount;const list=document.getElementById('log-list'),e=document.createElement('div');e.className='log-entry gunshot';e.innerHTML=`<div><div class="log-type">GUNSHOT${d.simulated?' [SIM]':''}</div><div class="log-details">CONF:${Math.round((d.confidence||0)*100)}% · TDOA:${(d.tdoa_ms||0).toFixed(3)}ms</div></div><div><div class="log-angle">${d.doa!=null?Math.round(d.doa)+'°':'--'}</div><div class="log-time">${d.timestamp_iso||'--'}</div></div>`;list.prepend(e)}async function clearEvents(){await fetch(`${API}/api/events`,{method:'DELETE'}).catch(()=>{});document.getElementById('log-list').innerHTML='';eventCount=0;document.getElementById('log-count').textContent='0';document.getElementById('hdr-events').textContent='0'}const wC=document.getElementById('waveform'),wX=wC.getContext('2d');function drawWaveform(data){const W=wC.offsetWidth||340,H=70;wC.width=W;wX.fillStyle='#080b0f';wX.fillRect(0,0,W,H);wX.beginPath();wX.strokeStyle=detecting?'#ff3c3c':'#00ff88';wX.lineWidth=1;wX.shadowBlur=detecting?8:4;wX.shadowColor=detecting?'#ff3c3c':'#00ff88';const step=Math.floor(data.length/W);for(let i=0;i<W;i++){const y=H/2+(data[i*step]||0)*32;i===0?wX.moveTo(i,y):wX.lineTo(i,y)}wX.stroke();wX.shadowBlur=0;wX.beginPath();wX.strokeStyle='rgba(26,37,53,.8)';wX.lineWidth=.5;wX.moveTo(0,H/2);wX.lineTo(W,H/2);wX.stroke()}const pC=document.getElementById('polar'),pX=pC.getContext('2d');function sz(){return pC.offsetWidth||340}function drawGrid(){const S=sz(),cx=S/2,cy=S/2,r=S/2-24;pX.clearRect(0,0,S,S);pC.width=S;pC.height=S;pX.fillStyle='rgba(8,11,15,.95)';pX.fillRect(0,0,S,S);for(let i=1;i<=4;i++){pX.beginPath();pX.arc(cx,cy,r*i/4,0,Math.PI*2);pX.strokeStyle=`rgba(26,37,53,${i===4?.8:.4})`;pX.lineWidth=i===4?1.5:.5;pX.stroke()}for(let a=0;a<360;a+=30){const rad=(a-90)*Math.PI/180;pX.beginPath();pX.moveTo(cx,cy);pX.lineTo(cx+r*Math.cos(rad),cy+r*Math.sin(rad));pX.strokeStyle='rgba(26,37,53,.6)';pX.lineWidth=.5;pX.stroke();const lr=r+14;pX.fillStyle='rgba(74,96,112,.8)';pX.font=`${Math.max(8,S/46)}px Share Tech Mono`;pX.textAlign='center';pX.textBaseline='middle';pX.fillText(a+'°',cx+lr*Math.cos(rad),cy+lr*Math.sin(rad))}}function renderPolar(){const S=sz(),cx=S/2,cy=S/2,r=S/2-24;drawGrid();const now=Date.now()/1000,sweep=(now*.4%1)*Math.PI*2-Math.PI/2;pX.save();pX.globalAlpha=.12;pX.beginPath();pX.moveTo(cx,cy);pX.arc(cx,cy,r,sweep-.8,sweep);pX.closePath();pX.fillStyle='rgba(0,255,136,.3)';pX.fill();pX.restore();pX.save();pX.globalAlpha=.5;pX.beginPath();pX.moveTo(cx,cy);pX.lineTo(cx+r*Math.cos(sweep),cy+r*Math.sin(sweep));pX.strokeStyle='#00ff88';pX.lineWidth=1;pX.stroke();pX.restore();for(let i=particles.length-1;i>=0;i--){const p=particles[i];p.radius+=2.5;p.life-=.025;if(p.life<=0){particles.splice(i,1);continue}pX.beginPath();pX.arc(cx+p.radius*Math.cos(p.angle+p.spread),cy+p.radius*Math.sin(p.angle+p.spread),2,0,Math.PI*2);pX.fillStyle=`rgba(255,60,60,${p.life*.8})`;pX.fill()}if(doaAngle!==null){const rad=doaAngle*Math.PI/180-Math.PI/2;const g=pX.createLinearGradient(cx,cy,cx+r*Math.cos(rad),cy+r*Math.sin(rad));g.addColorStop(0,'rgba(255,60,60,0)');g.addColorStop(1,detecting?'rgba(255,60,60,.95)':'rgba(0,255,136,.75)');pX.beginPath();pX.moveTo(cx,cy);pX.lineTo(cx+r*Math.cos(rad),cy+r*Math.sin(rad));pX.strokeStyle=g;pX.lineWidth=detecting?3:1.5;pX.stroke();const sp=15*Math.PI/180;pX.beginPath();pX.moveTo(cx,cy);pX.arc(cx,cy,r,rad-sp,rad+sp);pX.closePath();pX.fillStyle=detecting?'rgba(255,60,60,.07)':'rgba(0,255,136,.04)';pX.fill();pX.beginPath();pX.arc(cx+r*Math.cos(rad),cy+r*Math.sin(rad),detecting?6:4,0,Math.PI*2);pX.fillStyle=detecting?'#ff3c3c':'#00ff88';pX.fill();if(detecting)for(let i=0;i<3;i++)particles.push({angle:rad,radius:0,life:1,spread:(Math.random()-.5)*.35})}requestAnimationFrame(renderPolar)}renderPolar();</script></body></html>"""
+def classify(sig_a, sig_b, threshold):
+    r = rms(sig_a)
+    if r < threshold: return False, 0.0
+    spec = np.abs(np.fft.rfft(sig_a))
+    geo = np.exp(np.mean(np.log(spec + 1e-10)))
+    arith = np.mean(spec)
+    conf = 0.6 * min(r / (threshold * 3), 1.0) + 0.4 * min((geo / (arith + 1e-10)) / 0.3, 1.0)
+    return True, float(conf)
 
-@app.get("/",response_class=HTMLResponse)
-async def root(): return HTML
+HTML = """<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width,initial-scale=1.0,maximum-scale=1.0">
+<title>ACOUSTIC SENTINEL v3</title>
+<link href="https://fonts.googleapis.com/css2?family=Share+Tech+Mono&family=Orbitron:wght@400;700;900&display=swap" rel="stylesheet">
+<link rel="stylesheet" href="https://unpkg.com/leaflet@1.9.4/dist/leaflet.css"/>
+<script src="https://unpkg.com/leaflet@1.9.4/dist/leaflet.js"></script>
+<style>
+:root{--bg:#080b0f;--panel:#0d1117;--border:#1a2535;--accent:#00ff88;--accent2:#ff3c3c;--accent3:#ffb800;--dim:#1e2d3d;--text:#c8d8e8;--text-dim:#4a6070}
+*{margin:0;padding:0;box-sizing:border-box}
+body{background:var(--bg);color:var(--text);font-family:'Share Tech Mono',monospace;min-height:100vh}
+header{display:flex;align-items:center;justify-content:space-between;padding:12px 16px;border-bottom:1px solid var(--border);background:rgba(13,17,23,.97);position:sticky;top:0;z-index:1000;flex-wrap:wrap;gap:8px}
+.logo{display:flex;align-items:center;gap:12px}
+.logo-icon{width:32px;height:32px;border:2px solid var(--accent);border-radius:50%;display:flex;align-items:center;justify-content:center;position:relative;box-shadow:0 0 20px rgba(0,255,136,.3);flex-shrink:0}
+.logo-icon::before{content:'';width:7px;height:7px;background:var(--accent);border-radius:50%;animation:pulse 2s infinite}
+.logo-icon::after{content:'';position:absolute;width:44px;height:44px;border:1px solid rgba(0,255,136,.2);border-radius:50%;animation:radar-ring 2s infinite}
+@keyframes radar-ring{0%{transform:scale(.7);opacity:.8}100%{transform:scale(1.4);opacity:0}}
+@keyframes pulse{0%,100%{opacity:1}50%{opacity:.3}}
+@keyframes flash{from{opacity:1}to{opacity:.4}}
+@keyframes alarmPulse{0%,100%{background:rgba(255,60,60,0)}50%{background:rgba(255,60,60,0.15)}}
+.logo-text{font-family:'Orbitron',monospace;font-weight:900;font-size:14px;letter-spacing:3px;color:var(--accent)}
+.logo-sub{font-size:8px;color:var(--text-dim);letter-spacing:2px}
+.hdr-right{display:flex;gap:12px;align-items:center;flex-wrap:wrap}
+.status-item{text-align:center;font-size:9px;color:var(--text-dim)}
+.status-val{display:block;font-family:'Orbitron',monospace;font-size:12px;color:var(--accent)}
+#system-status{display:flex;align-items:center;gap:6px;font-size:10px;letter-spacing:2px}
+.dot{width:7px;height:7px;border-radius:50%;background:var(--text-dim);transition:all .3s;flex-shrink:0}
+.dot.active{background:var(--accent);box-shadow:0 0 20px rgba(0,255,136,.3);animation:pulse 1.5s infinite}
+.dot.alert{background:var(--accent2);box-shadow:0 0 20px rgba(255,60,60,.5);animation:pulse .5s infinite}
+.dot.warn{background:var(--accent3);animation:pulse 1s infinite}
 
-@app.get("/api/health")
-async def health(): return {"status":"ok","uptime":time.time()}
+/* TABS */
+.tabs{display:flex;border-bottom:1px solid var(--border);background:var(--panel);position:sticky;top:65px;z-index:999}
+.tab{flex:1;padding:12px 4px;text-align:center;font-family:'Orbitron',monospace;font-size:9px;letter-spacing:2px;color:var(--text-dim);cursor:pointer;border-bottom:2px solid transparent;transition:all .2s;-webkit-tap-highlight-color:transparent}
+.tab.active{color:var(--accent);border-bottom-color:var(--accent)}
+.tab-content{display:none}
+.tab-content.active{display:block}
 
-@app.get("/api/events")
-async def get_events(): return {"events":events,"count":len(events)}
+/* ALARM OVERLAY */
+#alarm-overlay{display:none;position:fixed;inset:0;z-index:9999;pointer-events:none;animation:alarmPulse .4s infinite}
+#alarm-overlay.active{display:block}
 
-@app.delete("/api/events")
-async def clear_events(): events.clear(); return {"status":"cleared"}
+/* PANELS */
+.panel{border:1px solid var(--border);background:var(--panel);position:relative;overflow:hidden}
+.panel::before{content:'';position:absolute;top:0;left:0;right:0;height:1px;background:linear-gradient(90deg,transparent,var(--accent),transparent);opacity:.4}
+.panel-label{position:absolute;top:10px;left:14px;font-size:9px;letter-spacing:3px;color:var(--text-dim);z-index:2}
+.panel-label span{color:var(--accent)}
 
-@app.post("/api/simulate")
-async def simulate(angle:float=90.0,mic_spacing:float=0.5):
-    cos_theta=math.cos(math.radians(angle))
-    tdoa_ms=(mic_spacing*cos_theta)/SPEED_OF_SOUND*1000
-    confidence=0.85+0.12*abs(math.sin(math.radians(angle)))
-    event={"id":len(events)+1,"timestamp":time.time(),"timestamp_iso":time.strftime("%H:%M:%S",time.gmtime()),"doa":round(angle,1),"tdoa_ms":round(tdoa_ms,4),"confidence":round(confidence,3),"db_a":round(-20+10*abs(math.sin(math.radians(angle))),1),"snr":42.0,"simulated":True}
-    events.append(event); await manager.broadcast({**event,"is_gunshot":True}); return event
+/* DOA TAB */
+.doa-panel{display:flex;flex-direction:column;align-items:center;padding:40px 16px 20px;gap:16px}
+.polar-wrap{position:relative;width:min(320px,88vw);height:min(320px,88vw)}
+#polar{width:100%;height:100%}
+.doa-readout{text-align:center;width:100%}
+.doa-angle{font-family:'Orbitron',monospace;font-size:44px;font-weight:900;color:var(--accent);line-height:1}
+.doa-label{font-size:9px;color:var(--text-dim);letter-spacing:3px;margin-top:4px}
+.tdoa-display{display:flex;gap:20px;margin-top:10px;justify-content:center}
+.tdoa-item{text-align:center}
+.tdoa-val{font-family:'Orbitron',monospace;font-size:13px;color:var(--accent3)}
+.tdoa-lbl{font-size:8px;color:var(--text-dim)}
 
-class ConnectionManager:
-    def __init__(self): self.active=[]
-    async def connect(self,ws): await ws.accept(); self.active.append(ws)
-    def disconnect(self,ws):
-        if ws in self.active: self.active.remove(ws)
-    async def broadcast(self,data):
-        dead=[]
-        for w in self.active:
-            try: await w.send_json(data)
-            except: dead.append(w)
-        for w in dead: self.disconnect(w)
+/* DETECT */
+.detect-panel{padding:40px 16px 16px}
+.detect-status{display:flex;align-items:center;justify-content:space-between;margin-bottom:12px}
+.detect-badge{font-family:'Orbitron',monospace;font-size:10px;letter-spacing:2px;padding:5px 12px;border:1px solid var(--text-dim);color:var(--text-dim);transition:all .3s}
+.detect-badge.gunshot{border-color:var(--accent2);color:var(--accent2);box-shadow:0 0 20px rgba(255,60,60,.5);animation:flash .3s ease infinite alternate}
+.detect-badge.clear{border-color:var(--accent);color:var(--accent)}
+.confidence-bar{height:4px;background:var(--dim);border-radius:2px;overflow:hidden;margin-bottom:10px}
+.confidence-fill{height:100%;background:linear-gradient(90deg,var(--accent),var(--accent3));width:0%;transition:width .4s ease;border-radius:2px}
+.conf-label{font-size:9px;color:var(--text-dim);letter-spacing:2px}
+.conf-val{float:right;color:var(--accent3)}
+#waveform{width:100%;height:65px;display:block;border:1px solid var(--dim);border-radius:2px;margin-top:10px}
 
-manager=ConnectionManager()
+/* MIC */
+.mic-panel{padding:40px 16px 16px}
+.mic-array{display:flex;gap:10px;align-items:center;margin-bottom:14px}
+.mic-unit{flex:1;border:1px solid var(--dim);padding:10px;text-align:center;transition:all .3s}
+.mic-unit.active{border-color:var(--accent);box-shadow:0 0 20px rgba(0,255,136,.3)}
+.mic-name{font-size:9px;color:var(--text-dim);letter-spacing:2px}
+.mic-level{font-family:'Orbitron',monospace;font-size:15px;color:var(--accent);margin:4px 0}
+.mic-bar{height:3px;background:var(--dim);border-radius:2px;overflow:hidden}
+.mic-bar-fill{height:100%;background:var(--accent);width:0%;transition:width .1s;border-radius:2px}
+.mic-arrow{font-size:18px;color:var(--text-dim);flex-shrink:0}
+.spacing-control{display:flex;align-items:center;gap:10px;font-size:10px;color:var(--text-dim);margin-bottom:12px}
+.spacing-control input[type=range]{flex:1;-webkit-appearance:none;height:2px;background:var(--dim);outline:none;border-radius:2px}
+.spacing-control input[type=range]::-webkit-slider-thumb{-webkit-appearance:none;width:14px;height:14px;background:var(--accent);border-radius:50%;cursor:pointer}
+.spacing-val{color:var(--accent);min-width:50px}
+.btn{width:100%;padding:12px;font-family:'Orbitron',monospace;font-size:10px;letter-spacing:3px;border:1px solid var(--accent);background:transparent;color:var(--accent);cursor:pointer;transition:all .2s;touch-action:manipulation;margin-bottom:6px}
+.btn.active{background:rgba(0,255,136,.1)}
+.btn.danger{border-color:var(--accent2);color:var(--accent2)}
+.btn.warn{border-color:var(--accent3);color:var(--accent3)}
+.btn.on{background:rgba(255,184,0,.15);border-color:var(--accent3);color:var(--accent3)}
+.sim-row{display:flex;gap:6px;margin-top:4px}
+.btn-sm{padding:10px 4px;font-size:8px;flex:1;margin-bottom:0}
 
-@app.websocket("/ws/audio")
-async def audio_ws(websocket:WebSocket):
-    await manager.connect(websocket); cooldown=0
-    try:
-        while True:
-            frame=json.loads(await websocket.receive_text())
-            mic_a=np.array(frame.get("mic_a",[]),dtype=np.float32)
-            mic_b=np.array(frame.get("mic_b",[]),dtype=np.float32)
-            spacing=float(frame.get("mic_spacing",0.5)); sr=int(frame.get("sample_rate",SAMPLE_RATE))
-            if len(mic_a)==0: continue
-            max_lag=int((spacing/SPEED_OF_SOUND)*sr)+10
-            lag,gcc_peak=gcc_phat(mic_a,mic_b,max_lag=max_lag)
-            doa=tdoa_to_doa(lag,spacing); tdoa_ms=(lag/sr)*1000.0
-            rms_a,rms_b=rms(mic_a),rms(mic_b); db_a,db_b=db(mic_a),db(mic_b)
-            is_gs,conf=False,0.0
-            if cooldown==0:
-                is_gs,conf=classify(mic_a,mic_b,GUNSHOT_RMS_THRESHOLD)
-                if is_gs:
-                    cooldown=COOLDOWN_FRAMES
-                    events.append({"id":len(events)+1,"timestamp":time.time(),"timestamp_iso":time.strftime("%H:%M:%S",time.gmtime()),"doa":round(doa,1),"tdoa_ms":round(tdoa_ms,4),"confidence":round(conf,3),"db_a":round(db_a,1)})
-            else: cooldown-=1
-            await websocket.send_json({"doa":round(doa,2),"tdoa_ms":round(tdoa_ms,4),"rms_a":round(rms_a,5),"rms_b":round(rms_b,5),"db_a":round(db_a,1),"db_b":round(db_b,1),"snr":round(db_a+60,1),"gcc_peak":round(gcc_peak,4),"is_gunshot":is_gs,"confidence":round(conf,3),"timestamp":time.time()})
-    except WebSocketDisconnect: manager.disconnect(websocket)
-    except Exception: manager.disconnect(websocket)
+/* MAP TAB */
+#map{height:350px;width:100%;z-index:1}
+.map-panel{padding:40px 0 0}
+.map-controls{padding:12px 16px;display:flex;gap:8px;flex-wrap:wrap}
+.map-btn{flex:1;padding:8px;font-family:'Orbitron',monospace;font-size:8px;letter-spacing:2px;border:1px solid var(--border);background:var(--panel);color:var(--text-dim);cursor:pointer;min-width:80px;touch-action:manipulation}
+.map-btn.active{border-color:var(--accent);color:var(--accent)}
+.shot-count-badge{display:inline-block;background:var(--accent2);color:#fff;font-family:'Orbitron',monospace;font-size:9px;padding:2px 8px;border-radius:2px;margin-left:8px}
+
+/* TRACKER TAB */
+.tracker-panel{padding:16px}
+.tracker-grid{display:grid;grid-template-columns:1fr 1fr;gap:8px;margin-bottom:12px}
+.tracker-card{border:1px solid var(--border);padding:12px;text-align:center;position:relative;transition:all .3s}
+.tracker-card.active{border-color:var(--accent2);box-shadow:0 0 15px rgba(255,60,60,.2)}
+.tracker-card.inactive{opacity:.4}
+.tc-id{font-family:'Orbitron',monospace;font-size:18px;font-weight:900;color:var(--accent2)}
+.tc-angle{font-family:'Orbitron',monospace;font-size:24px;font-weight:900;color:var(--accent)}
+.tc-time{font-size:8px;color:var(--text-dim);margin-top:4px}
+.tc-conf{font-size:9px;color:var(--accent3)}
+.tracker-stats{display:grid;grid-template-columns:repeat(3,1fr);gap:8px;margin-bottom:12px}
+.stat-card{border:1px solid var(--border);padding:10px;text-align:center}
+.stat-val{font-family:'Orbitron',monospace;font-size:20px;color:var(--accent)}
+.stat-lbl{font-size:8px;color:var(--text-dim);letter-spacing:1px;margin-top:2px}
+.stat-card.danger .stat-val{color:var(--accent2)}
+.stat-card.warn .stat-val{color:var(--accent3)}
+
+/* LOG */
+.log-panel{padding:40px 0 0}
+.log-header{padding:0 16px 12px;display:flex;justify-content:space-between;align-items:center;border-bottom:1px solid var(--dim)}
+.log-count{font-family:'Orbitron',monospace;font-size:20px;color:var(--accent2)}
+.log-count-lbl{font-size:9px;color:var(--text-dim);letter-spacing:2px;display:block}
+.log-list{max-height:300px;overflow-y:auto}
+.log-entry{padding:10px 16px;border-bottom:1px solid rgba(26,37,53,.5);display:grid;grid-template-columns:1fr auto;gap:4px;animation:slideIn .3s ease}
+@keyframes slideIn{from{opacity:0;transform:translateX(8px)}to{opacity:1;transform:translateX(0)}}
+.log-entry.gunshot{border-left:3px solid var(--accent2)}
+.log-type{font-family:'Orbitron',monospace;font-size:10px;letter-spacing:2px;color:var(--accent2)}
+.log-details{font-size:9px;color:var(--text-dim);margin-top:2px}
+.log-time{font-size:9px;color:var(--text-dim);text-align:right}
+.log-angle{font-family:'Orbitron',monospace;font-size:11px;color:var(--accent3)}
+
+.ws-bar{position:fixed;bottom:0;left:0;right:0;background:var(--panel);border-top:1px solid var(--border);padding:8px 16px;display:flex;align-items:center;gap:8px;font-size:9px;letter-spacing:2px;color:var(--text-dim);z-index:998}
+
+/* Leaflet dark override */
+.leaflet-container{background:#0d1117!important}
+.leaflet-tile{filter:invert(1) hue-rotate(180deg) brightness(0.7) contrast(1.2)}
+</style>
+</head>
+<body>
+
+<div id="alarm-overlay"></div>
+
+<header>
+  <div class="logo">
+    <div class="logo-icon"></div>
+    <div>
+      <div class="logo-text">ACOUSTIC SENTINEL <span style="color:var(--accent3);font-size:10px">v3</span></div>
+      <div class="logo-sub">DOA · MAP · MULTI-TRACK · ALARM</div>
+    </div>
+  </div>
+  <div class="hdr-right">
+    <div class="status-item"><span class="status-val" id="hdr-time">--:--:--</span>UTC</div>
+    <div class="status-item"><span class="status-val" id="hdr-events">0</span>SHOTS</div>
+    <div id="system-status"><div class="dot" id="sys-dot"></div><span id="sys-label">STANDBY</span></div>
+  </div>
+</header>
+
+<!-- TABS -->
+<div class="tabs">
+  <div class="tab active" onclick="switchTab('doa')">📡 DOA</div>
+  <div class="tab" onclick="switchTab('map')">🗺 MAP</div>
+  <div class="tab" onclick="switchTab('tracker')">🎯 TRACKER</div>
+  <div class="tab" onclick="switchTab('log')">📋 LOG</div>
+</div>
+
+<!-- ═══ TAB 1: DOA ═══ -->
+<div id="tab-doa" class="tab-content active">
+  <div class="panel doa-panel">
+    <div class="panel-label"><span>01</span> / POLAR DOA</div>
+    <div class="polar-wrap"><canvas id="polar" width="320" height="320"></canvas></div>
+    <div class="doa-readout">
+      <div class="doa-angle" id="doa-angle">---°</div>
+      <div class="doa-label">DIRECTION OF ARRIVAL</div>
+      <div class="tdoa-display">
+        <div class="tdoa-item"><div class="tdoa-val" id="tdoa-val">0.000</div><div class="tdoa-lbl">TDOA ms</div></div>
+        <div class="tdoa-item"><div class="tdoa-val" id="snr-val">--</div><div class="tdoa-lbl">SNR dB</div></div>
+        <div class="tdoa-item"><div class="tdoa-val" id="dist-val">0.50</div><div class="tdoa-lbl">MIC m</div></div>
+      </div>
+    </div>
+  </div>
+
+  <div class="panel detect-panel">
+    <div class="panel-label"><span>02</span> / CLASSIFICATION</div>
+    <div class="detect-status">
+      <div class="detect-badge" id="detect-badge">MONITORING</div>
+      <div style="text-align:right;font-size:9px;color:var(--text-dim)">
+        <div>LAST: <span id="last-detect" style="color:var(--text)">--</span></div>
+        <div>PEAK: <span id="peak-db" style="color:var(--accent3)">-- dB</span></div>
+      </div>
+    </div>
+    <div class="conf-label">CONFIDENCE <span class="conf-val" id="conf-pct">0%</span></div>
+    <div class="confidence-bar"><div class="confidence-fill" id="conf-fill"></div></div>
+    <canvas id="waveform" width="340" height="65"></canvas>
+  </div>
+
+  <div class="panel mic-panel">
+    <div class="panel-label"><span>03</span> / ARRAY & CONTROLS</div>
+    <div class="mic-array">
+      <div class="mic-unit" id="mic0"><div class="mic-name">MIC A</div><div class="mic-level" id="mic0-lvl">-∞</div><div class="mic-bar"><div class="mic-bar-fill" id="mic0-bar"></div></div></div>
+      <div class="mic-arrow">⟷</div>
+      <div class="mic-unit" id="mic1"><div class="mic-name">MIC B</div><div class="mic-level" id="mic1-lvl">-∞</div><div class="mic-bar"><div class="mic-bar-fill" id="mic1-bar"></div></div></div>
+    </div>
+    <div class="spacing-control">SPACING <input type="range" id="spacing-slider" min="0.1" max="2.0" step="0.05" value="0.5"> <span class="spacing-val" id="spacing-val">0.50 m</span></div>
+    <button class="btn" id="start-btn" onclick="toggleListening()">▶ START LISTENING</button>
+    <button class="btn warn" id="alarm-btn" onclick="toggleAlarm()">🔔 ALARM: OFF</button>
+    <div class="sim-row">
+      <button class="btn-sm btn" onclick="simGunshot(45)">SIM 45°</button>
+      <button class="btn-sm btn" onclick="simGunshot(90)">SIM 90°</button>
+      <button class="btn-sm btn" onclick="simGunshot(135)">SIM 135°</button>
+      <button class="btn-sm btn danger" onclick="clearAll()">CLR</button>
+    </div>
+  </div>
+</div>
+
+<!-- ═══ TAB 2: MAP ═══ -->
+<div id="tab-map" class="tab-content">
+  <div class="panel map-panel">
+    <div class="panel-label"><span>02</span> / GUNSHOT MAP <span id="map-shot-count" class="shot-count-badge">0 SHOTS</span></div>
+    <div id="map"></div>
+    <div class="map-controls">
+      <button class="map-btn active" id="map-center-btn" onclick="centerMap()">📍 MY LOCATION</button>
+      <button class="map-btn" onclick="clearMapMarkers()">🗑 CLEAR PINS</button>
+      <button class="map-btn" onclick="simGunshot(Math.random()*180)">💥 SIM SHOT</button>
+    </div>
+    <div style="padding:0 16px 12px;font-size:9px;color:var(--text-dim);letter-spacing:1px">
+      ⚠ Map pins show estimated direction from your location. Distance is approximate based on sound level.
+    </div>
+  </div>
+</div>
+
+<!-- ═══ TAB 3: TRACKER ═══ -->
+<div id="tab-tracker" class="tab-content">
+  <div style="padding:16px 16px 8px">
+    <div class="tracker-stats">
+      <div class="stat-card danger"><div class="stat-val" id="stat-total">0</div><div class="stat-lbl">TOTAL SHOTS</div></div>
+      <div class="stat-card warn"><div class="stat-val" id="stat-last-angle">--</div><div class="stat-lbl">LAST ANGLE</div></div>
+      <div class="stat-card"><div class="stat-val" id="stat-avg-conf">--%</div><div class="stat-lbl">AVG CONF</div></div>
+    </div>
+    <div style="font-family:'Orbitron',monospace;font-size:9px;letter-spacing:3px;color:var(--text-dim);margin-bottom:10px">RECENT DETECTIONS</div>
+    <div class="tracker-grid" id="tracker-grid">
+      <div class="tracker-card inactive" id="tc-0"><div class="tc-id">#--</div><div class="tc-angle">---°</div><div class="tc-conf">--%</div><div class="tc-time">--</div></div>
+      <div class="tracker-card inactive" id="tc-1"><div class="tc-id">#--</div><div class="tc-angle">---°</div><div class="tc-conf">--%</div><div class="tc-time">--</div></div>
+      <div class="tracker-card inactive" id="tc-2"><div class="tc-id">#--</div><div class="tc-angle">---°</div><div class="tc-conf">--%</div><div class="tc-time">--</div></div>
+      <div class="tracker-card inactive" id="tc-3"><div class="tc-id">#--</div><div class="tc-angle">---°</div><div class="tc-conf">--%</div><div class="tc-time">--</div></div>
+    </div>
+
+    <div style="font-family:'Orbitron',monospace;font-size:9px;letter-spacing:3px;color:var(--text-dim);margin-bottom:10px">DIRECTION HISTOGRAM</div>
+    <canvas id="histogram" width="340" height="120" style="width:100%;border:1px solid var(--dim);border-radius:2px"></canvas>
+  </div>
+</div>
+
+<!-- ═══ TAB 4: LOG ═══ -->
+<div id="tab-log" class="tab-content">
+  <div class="panel log-panel">
+    <div class="panel-label"><span>04</span> / EVENT LOG</div>
+    <div class="log-header">
+      <div><span class="log-count-lbl">TOTAL DETECTIONS</span><span class="log-count" id="log-count">0</span></div>
+      <button onclick="exportCSV()" style="font-family:'Orbitron',monospace;font-size:8px;letter-spacing:2px;padding:4px 10px;border:1px solid var(--accent);background:transparent;color:var(--accent);cursor:pointer">⬇ CSV</button>
+    </div>
+    <div class="log-list" id="log-list"></div>
+  </div>
+</div>
+
+<div class="ws-bar">
+  <div class="dot" id="ws-dot"></div>
+  <span id="ws-label">CONNECTING...</span>
+</div>
+
+<script>
+// ═══════════════════════════════════════════
+// STATE
+// ═══════════════════════════════════════════
+const SPEED=343, API=window.location.origin;
+const WS_URL=(location.protocol==='https:'?'wss:':'ws:')+'//'+location.host+'/ws/audio';
+let ws, audioCtx, analyserA, analyserB, stream;
+let isListening=false, animFrame, micSpacing=.5;
+let doaAngle=null, tdoaMs=0, detecting=false, detectTimeout;
+let eventCount=0, lastPing=Date.now();
+const doaHistory=[], HIST=8, particles=[];
+let alarmEnabled=false, alarmCtx=null;
+let userLat=null, userLng=null;
+let mapObj=null, mapMarkers=[], userMarker=null;
+let allEvents=[];
+const histogramData=new Array(18).fill(0); // 18 bins of 10°
+
+// ═══════════════════════════════════════════
+// TABS
+// ═══════════════════════════════════════════
+function switchTab(name){
+  document.querySelectorAll('.tab').forEach((t,i)=>{
+    const names=['doa','map'
