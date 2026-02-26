@@ -319,7 +319,6 @@ userMarker=L.circleMarker([userLat,userLng],{radius:10,color:'#00ff88',fillColor
 }
 }
 initMap();
-
 function centerMap(){if(userLat&&userLng)mapObj.setView([userLat,userLng],15)}
 
 function addMapMarker(angle,confidence,eventId){
